@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>flowcut 流网剖面台</title>
+<style>
+:root{--ink:#131a20;--paper:#eef1f0;--band:#ccd6da;--flow:#1d6a78;--cut:#ab3320;--line:#9db0b6;--dim:#57666d;--ok:#1d6b48}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.5 system-ui,"Segoe UI",sans-serif}
+.deck{max-width:1020px;margin:0 auto;padding:14px 16px 40px}
+.readout{border-bottom:3px double var(--ink);padding-bottom:8px}
+.ro-name{font-size:19px;letter-spacing:3px}
+.ro-line{margin-top:6px;display:flex;flex-wrap:wrap;gap:14px;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--dim)}
+.ro-cell b{color:var(--ink);font-weight:700}
+.seal{font-size:11px;padding:0 5px;border:1px solid var(--line);color:var(--dim)}
+.seal.ok{color:var(--ok);border-color:var(--ok)}
+.seal.no{color:#fff;background:var(--cut);border-color:var(--cut)}
+.stage{margin-top:10px;border:1px solid var(--line);background:#f7f9f8}
+svg{display:block;width:100%;height:auto}
+.stage-foot{display:flex;gap:16px;flex-wrap:wrap;padding:5px 8px;border-top:1px dashed var(--line);font-size:12px;color:var(--dim);font-family:ui-monospace,Consolas,monospace}
+.track,.chains{margin-top:14px}
+.track-head,.chains-head{display:flex;justify-content:space-between;font-size:12px;color:var(--dim);border-bottom:1px solid var(--line);padding-bottom:3px}
+.ticks{display:flex;gap:2px;margin-top:6px}
+.tk{flex:1 1 0;height:36px;border:1px solid var(--line);background:#fff;cursor:pointer;padding:0;font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--dim);position:relative}
+.tk i{display:block;position:absolute;left:0;right:0;bottom:0;background:#b9d5d9;height:0}
+.tk.flat i{background:repeating-linear-gradient(45deg,#e7d2cc,#e7d2cc 3px,#f7f9f8 3px,#f7f9f8 6px)}
+.tk.now{outline:2px solid var(--ink)}
+.chain{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:4px 0;border-bottom:1px dotted var(--line);font-family:ui-monospace,Consolas,monospace;font-size:12px}
+.nd{border:1px solid var(--ink);padding:0 6px;background:#fff}
+.nd.term{background:#e2e8ea}
+.hop{color:var(--dim)}
+.hop.rev{color:var(--cut);border-bottom:1px dashed var(--cut)}
+.amt{background:var(--flow);color:#fff;padding:0 6px}
+.empty{color:var(--dim);font-size:12px}
+.ledgerline{margin-top:14px;border-top:1px solid var(--line);padding-top:6px;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--dim)}
+</style></head>
+<body>
+<div class="deck">
+  <header class="readout">
+    <div class="ro-name">流网剖面台</div>
+    <div class="ro-line" id="readout"></div>
+  </header>
+
+  <section class="stage">
+    <svg id="net" viewBox="0 0 1000 360" preserveAspectRatio="xMidYMid meet"></svg>
+    <div class="stage-foot" id="stageFoot"></div>
+  </section>
+
+  <section class="track">
+    <div class="track-head"><span>轮次轨（点一段回看那一步的网）</span><span id="trackNow"></span></div>
+    <div class="ticks" id="ticks"></div>
+  </section>
+
+  <section class="chains">
+    <div class="chains-head"><span>增广链（到此步为止，红虚线是反悔弧）</span><span id="chainNow"></span></div>
+    <div id="chains"></div>
+  </section>
+
+  <div class="ledgerline" id="ledger"></div>
+</div>
+<script type="module">
+import { render } from "./app.js";
+import { valueOf, cutOf } from "./flow.js";
+import { capOk, consOk, roundsOk, cutOk, ledgerOk } from "./audit.js";
+
+const EMPTY = {
+  n: 6, source: 0, sink: 5, edges: [], arcs: [], level: [-1, -1, -1, -1, -1, -1],
+  rounds: [], augs: [], cuts: [], cutCap: 0, value: 0, bfs: 0, pushes: 0, pushed: 0,
+  blocked: 0, resets: 0
+};
+const BAD = "打不开 sample/flow.json：请照 README 起一个静态服务再打开本页。";
+const NS = "http://www.w3.org/2000/svg";
+
+let spec = null;
+let view = null;
+let at = 0;
+let cols = [];
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) {
+    node.className = cls;
+  }
+  if (text !== undefined) {
+    node.textContent = text;
+  }
+  return node;
+}
+
+function svg(tag, attrs) {
+  const node = document.createElementNS(NS, tag);
+  Object.keys(attrs).forEach(function (key) {
+    node.setAttribute(key, String(attrs[key]));
+  });
+  return node;
+}
+
+function stateAt() {
+  if (spec === null || view === null) {
+    return EMPTY;
+  }
+  return at === 0 ? spec.state : view.steps[at - 1];
+}
+
+function balances(state) {
+  const bal = [];
+  for (let i = 0; i < state.n; i += 1) {
+    bal.push(0);
+  }
+  (state.edges || []).forEach(function (edge, k) {
+    const arc = state.arcs[2 * k];
+    const flow = arc ? edge[2] - arc[2] : 0;
+    bal[edge[0]] -= flow;
+    bal[edge[1]] += flow;
+  });
+  return bal;
+}
+
+function layout() {
+  if (spec === null || view === null) {
+    cols = [];
+    return;
+  }
+  const lv = view.level || [];
+  const n = spec.state.n;
+  let top = -1;
+  lv.forEach(function (value) {
+    if (value > top) {
+      top = value;
+    }
+  });
+  if (top < 0) {
+    cols = [];
+    for (let i = 0; i < n; i += 1) {
+      cols.push(i === spec.state.source ? 0 : 1);
+    }
+    return;
+  }
+  cols = lv.map(function (value) {
+    return value < 0 ? top + 1 : value;
+  });
+}
+
+function nodePos(state) {
+  const n = spec ? spec.state.n : 6;
+  const top = cols.reduce(function (best, value) { return value > best ? value : best; }, 0);
+  const span = top > 0 ? (1000 - 180) / top : 1;
+  const buckets = [];
+  for (let c = 0; c <= top; c += 1) {
+    buckets.push([]);
+  }
+  for (let i = 0; i < n; i += 1) {
+    buckets[cols[i] >= 0 && cols[i] <= top ? cols[i] : top].push(i);
+  }
+  const pos = [];
+  for (let i = 0; i < n; i += 1) {
+    pos.push([0, 0]);
+  }
+  buckets.forEach(function (group, c) {
+    group.forEach(function (id, rank) {
+      const x = 90 + c * span;
+      const y = 46 + (rank + 1) * (250 / (group.length + 1));
+      pos[id] = [x, y];
+    });
+  });
+  return pos;
+}
+
+function drawNet(state) {
+  const box = document.getElementById("net");
+  box.textContent = "";
+  if (spec === null || cols.length !== state.n) {
+    return;
+  }
+  const pos = nodePos(state);
+  const bal = balances(state);
+  const reach = state.level || [];
+  const cutCap = state.cutCap || 0;
+  const cuts = state.cuts || [];
+  const cutKeys = {};
+  cuts.forEach(function (pair) { cutKeys[pair[0] + ">" + pair[1]] = true; });
+
+  if (cuts.length > 0) {
+    let far = -1;
+    let near = 99;
+    for (let i = 0; i < state.n; i += 1) {
+      if (reach[i] >= 0 && cols[i] > far) { far = cols[i]; }
+      if (reach[i] < 0 && cols[i] < near) { near = cols[i]; }
+    }
+    if (far >= 0 && near <= 99) {
+      const edgeX = (90 + far * ((1000 - 180) / Math.max(1, cols.reduce(function (b, v) { return v > b ? v : b; }, 0)))
+                     + 90 + near * ((1000 - 180) / Math.max(1, cols.reduce(function (b, v) { return v > b ? v : b; }, 0)))) / 2;
+      box.appendChild(svg("rect", { x: edgeX, y: 8, width: 1000 - edgeX, height: 344, fill: "#efe3df", opacity: 0.55 }));
+      box.appendChild(svg("line", { x1: edgeX, y1: 8, x2: edgeX, y2: 352, stroke: "#ab3320",
+                                    "stroke-width": 2, "stroke-dasharray": "7 5" }));
+      const label = svg("text", { x: edgeX + 6, y: 22, fill: "#ab3320", "font-size": 12 });
+      label.textContent = "割容量 " + cutCap;
+      box.appendChild(label);
+    }
+  }
+
+  (state.edges || []).forEach(function (edge, k) {
+    const arc = state.arcs[2 * k];
+    if (!arc) {
+      return;
+    }
+    const from = pos[edge[0]];
+    const to = pos[edge[1]];
+    if (!from || !to) {
+      return;
+    }
+    const flow = edge[2] - arc[2];
+    const span = to[0] - from[0];
+    const path = "M " + from[0] + " " + from[1] + " C " + (from[0] + span * 0.45) + " " + from[1] + ", "
+               + (to[0] - span * 0.45) + " " + to[1] + ", " + to[0] + " " + to[1];
+    box.appendChild(svg("path", { d: path, fill: "none", stroke: "#ccd6da",
+                                  "stroke-width": Math.max(2, 2 + edge[2] * 5), "stroke-linecap": "butt" }));
+    if (flow > 0) {
+      box.appendChild(svg("path", { d: path, fill: "none", stroke: cutKeys[edge[0] + ">" + edge[1]] ? "#ab3320" : "#1d6a78",
+                                    "stroke-width": Math.max(1, 1 + flow * 5), "stroke-linecap": "butt" }));
+    }
+    const mid = svg("text", { x: (from[0] + to[0]) / 2, y: (from[1] + to[1]) / 2 - 6, fill: "#57666d", "font-size": 11 });
+    mid.textContent = edge[0] + "→" + edge[1] + " " + flow + "/" + edge[2] + (flow === edge[2] && edge[2] > 0 ? " 满" : "");
+    box.appendChild(mid);
+  });
+
+  for (let i = 0; i < state.n; i += 1) {
+    const spot = pos[i];
+    const isSource = i === state.source;
+    const isSink = i === state.sink;
+    const want = isSource ? -state.value : (isSink ? state.value : 0);
+    const good = bal[i] === want;
+    const node = svg("rect", { x: spot[0] - 16, y: spot[1] - 13, width: 32, height: 26, rx: 4,
+                               fill: reach[i] >= 0 ? "#ffffff" : "#e6e2e0",
+                               stroke: good ? "#131a20" : "#ab3320",
+                               "stroke-width": good ? 1.5 : 3,
+                               "stroke-dasharray": reach[i] >= 0 ? "" : "3 3" });
+    box.appendChild(node);
+    const text = svg("text", { x: spot[0], y: spot[1] + 4, "text-anchor": "middle",
+                               fill: good ? "#131a20" : "#ab3320", "font-size": 12 });
+    text.textContent = String(i);
+    box.appendChild(text);
+    if (isSource || isSink) {
+      const tag = svg("text", { x: spot[0], y: spot[1] - 18, "text-anchor": "middle", fill: "#57666d", "font-size": 11 });
+      tag.textContent = isSource ? "源" : "汇";
+      box.appendChild(tag);
+    }
+    if (!good) {
+      const mark = svg("text", { x: spot[0] + 20, y: spot[1] + 5, fill: "#ab3320", "font-size": 12 });
+      mark.textContent = "!";
+      box.appendChild(mark);
+    }
+  }
+}
+
+function drawReadout(state) {
+  const box = document.getElementById("readout");
+  box.textContent = "";
+  const cells = [
+    ["节点", String(state.n)],
+    ["源汇", state.source + "/" + state.sink],
+    ["边", String((state.edges || []).length)],
+    ["流量", String(state.value)],
+    ["割容量", String(state.cutCap)],
+    ["轮", String(state.bfs)],
+    ["增广", String(state.pushes)],
+    ["推量", String(state.pushed)],
+    ["没路轮", String(state.blocked)],
+    ["重置", String(state.resets)],
+    ["步", String(at) + "/" + (spec ? spec.events.length : 0)]
+  ];
+  cells.forEach(function (pair) {
+    const cell = el("span", "ro-cell");
+    cell.appendChild(document.createTextNode(pair[0] + " "));
+    const strong = el("b", "", pair[1]);
+    cell.appendChild(strong);
+    box.appendChild(cell);
+  });
+}
+
+function drawTicks() {
+  const box = document.getElementById("ticks");
+  box.textContent = "";
+  if (view === null) {
+    return;
+  }
+  const marks = [0].concat(view.round_steps || []);
+  const rounds = view.rounds || [];
+  let top = 1;
+  rounds.forEach(function (row) {
+    if (row[2] > top) {
+      top = row[2];
+    }
+  });
+  marks.forEach(function (spot, index) {
+    const button = el("button", "tk" + (index === 0 ? " start" : ""));
+    if (index > 0 && rounds[index - 1] && rounds[index - 1][1] === false) {
+      button.className += " flat";
+    }
+    if (spot === at) {
+      button.className += " now";
+    }
+    const fill = el("i", "");
+    if (index > 0 && rounds[index - 1]) {
+      fill.style.height = Math.round((rounds[index - 1][2] / top) * 26) + "px";
+    }
+    button.appendChild(fill);
+    button.appendChild(document.createTextNode(index === 0 ? "起" : "轮 " + index));
+    button.addEventListener("click", function () {
+      at = spot;
+      draw();
+    });
+    box.appendChild(button);
+  });
+  const now = document.getElementById("trackNow");
+  now.textContent = at === 0 ? "起点" : "第 " + at + " 步";
+}
+
+function drawChains(state) {
+  const box = document.getElementById("chains");
+  box.textContent = "";
+  const rows = state.augs || [];
+  if (rows.length === 0) {
+    box.appendChild(el("div", "empty", "还没有增广：先点轮次轨上的段。"));
+  }
+  rows.forEach(function (row, index) {
+    const line = el("div", "chain");
+    line.appendChild(el("span", "hop", "#" + (index + 1)));
+    const nodes = row[0];
+    const path = row[2];
+    for (let spot = 0; spot < nodes.length; spot += 1) {
+      const cell = el("span", "nd" + (spot === 0 || spot === nodes.length - 1 ? " term" : ""), String(nodes[spot]));
+      line.appendChild(cell);
+      if (spot < path.length) {
+        const rev = path[spot] % 2 === 1;
+        line.appendChild(el("span", "hop" + (rev ? " rev" : ""), rev ? "⇠ 弧 " + path[spot] : "→ 弧 " + path[spot]));
+      }
+    }
+    line.appendChild(el("span", "amt", "瓶颈 " + row[1]));
+    box.appendChild(line);
+  });
+  document.getElementById("chainNow").textContent = rows.length === 0 ? "" : rows.length + " 条";
+}
+
+function drawLedger(state) {
+  const box = document.getElementById("ledger");
+  box.textContent = "";
+  const bits = [
+    ["弧对", capOk(state)],
+    ["守恒", consOk(state)],
+    ["轮次", roundsOk(state)],
+    ["割", cutOk(state)],
+    ["增广账", ledgerOk(state)]
+  ];
+  box.appendChild(document.createTextNode("轮 " + state.bfs + " 次　增广 " + state.pushes + " 条　推量 "
+                                         + state.pushed + "　没找到路 " + state.blocked + " 轮　重置 " + state.resets + " 次"));
+  box.appendChild(document.createElement("br"));
+  bits.forEach(function (pair) {
+    const seal = el("span", "seal " + (pair[1] ? "ok" : "no"), pair[0] + (pair[1] ? " 自洽" : " 不自洽"));
+    box.appendChild(seal);
+    box.appendChild(document.createTextNode(" "));
+  });
+  const foot = document.getElementById("stageFoot");
+  foot.textContent = "";
+  const cutInfo = cutOf(state);
+  foot.appendChild(el("span", "", "可达 " + (cutInfo[0] || []).join("") + "（1 是残量还能到）"));
+  foot.appendChild(el("span", "", "割边 " + (state.cuts || []).map(function (pair) {
+    return pair[0] + "→" + pair[1];
+  }).join(" ")));
+  foot.appendChild(el("span", "", "最后一步 " + (at === 0 ? "起点" : (view.step_kind[at - 1] || "?"))));
+}
+
+function draw() {
+  if (spec === null) {
+    return;
+  }
+  const state = stateAt();
+  drawReadout(state);
+  drawNet(state);
+  drawTicks();
+  drawChains(state);
+  drawLedger(state);
+}
+
+fetch("sample/flow.json").then(function (reply) {
+  return reply.json();
+}).then(function (data) {
+  spec = data;
+  view = render(spec);
+  at = spec.events.length;
+  layout();
+  draw();
+}).catch(function () {
+  document.getElementById("readout").textContent = BAD;
+});
+</script>
+</body>
+</html>
